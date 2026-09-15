@@ -7,8 +7,13 @@ fn main() {
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("generated_tests.rs");
     let mut tests = String::new();
     for index in 0..DATABASE_TESTS {
+        let kind = if index.is_multiple_of(12) {
+            "isolated"
+        } else {
+            "reusable"
+        };
         tests.push_str(&format!(
-            "#[test]\nfn database_{index:04}() {{ crate::run_database_test({index}); }}\n"
+            "#[test]\nfn database_{kind}_{index:04}() {{ crate::run_database_test({index}); }}\n"
         ));
     }
     for index in 0..CPU_TESTS {
