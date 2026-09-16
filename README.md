@@ -104,6 +104,49 @@ PGRUST_EXTRA_ARGS='-c io_method=worker -c io_workers=32' \
 ./scripts/run.sh
 ```
 
+## Pgrust test mode
+
+The direct comparison above deliberately keeps the reusable-database harness and only swaps the server executable, so Pgrust's ephemeral-database path is never exercised. `PGRUST_EPHEMERAL=1` switches every database test to that path: the test connects to `tdb_repro_template__<pid>_<index>`, the server mints the database from the sealed template on first connection, and the janitor drops it once it has been idle for the grace period. There is no lease, rename, terminate, restore, or return. Setup seals the template with `pgrust_seal_template` instead of building the prepared-database pool, and `PGRUST_WARM_POOL=<n>` makes setup wait until the janitor has `n` warm spares before the timed interval starts.
+
+```bash
+PGRUST_BIN=/path/to/pgrust \
+BENCH_ROOT=/path/on/btrfs/pgrust-repro \
+ENGINES=pgrust \
+PGRUST_EPHEMERAL=1 \
+PGRUST_WARM_POOL=192 \
+PGRUST_EXTRA_ARGS='-c pgrust.ephemeral_db_pool_size=192 -c pgrust.ephemeral_db_wal_log_threshold=-1' \
+./scripts/run.sh
+```
+
+The two server settings matter. `pgrust.ephemeral_db_pool_size` defaults to 0, so without it every mint is a cold clone served by the janitor in batches of 32 per 500 ms tick. `pgrust.ephemeral_db_wal_log_threshold=-1` forces file-copy clones; the test profile switches to `STRATEGY wal_log` at 50 relations, which this 200-table template exceeds, and WAL-logging the template on every mint is what produces the "checkpoints are occurring too frequently" warnings in the server log. With file copies each clone is a reflink on a copy-on-write filesystem.
+
+`NEXTEST_FILTER` passes a Nextest filter expression to every run and `ENGINES` limits the run to one engine. `NEXTEST_FILTER='test(/_[0-9]*0$/)'` is a one-in-ten sample (600 tests, 160 of them database tests) that keeps the test mix and finishes both engines in about half a minute.
+
+### Results
+
+AWS c7a.24xlarge (AMD EPYC 9R14, 96 logical CPUs, x86_64, Ubuntu 24.04), PostgreSQL 18.6 from PGDG, Pgrust 0.3 built with `cargo build --release` from the `v0.3` tag, `BENCH_ROOT` on Btrfs. Nextest medians.
+
+Full 6,000-test suite, three runs each, unchanged harness:
+
+| Engine | Run 1 | Run 2 | Run 3 | Median |
+| --- | ---: | ---: | ---: | ---: |
+| PostgreSQL | 17.623s | 18.430s | 18.711s | **18.430s** |
+| Pgrust | 15.767s | 16.617s | 16.470s | **16.470s** |
+
+One-in-ten sample (`NEXTEST_FILTER='test(/_[0-9]*0$/)'`), medians:
+
+| Configuration | Sample | vs PostgreSQL |
+| --- | ---: | ---: |
+| PostgreSQL, reusable-database harness | 3.843s | 1.0x |
+| Pgrust, reusable-database harness | 3.151s | 1.2x faster |
+| Pgrust test mode, cold mints, default `wal_log_threshold=50` | 22.629s | 5.9x slower |
+| Pgrust test mode, cold mints, `wal_log_threshold=-1` | 4.199s | 1.1x slower |
+| Pgrust test mode, 192-spare warm pool, `wal_log_threshold=-1` | 0.550s | **7.0x faster** |
+
+Filling the 192-spare pool takes about 4.5 seconds per server start with file-copy clones (24 seconds with `wal_log`), outside the timed interval. The 440 CPU tests in the sample take about 0.14 seconds on their own, so the database tests went from roughly 3.7 seconds under PostgreSQL to roughly 0.4 seconds.
+
+Two setup notes for a fresh box: Pgrust with `max_connections=1024` needs about 74,000 open file descriptors and refuses to start under the Ubuntu default hard limit of 65,536, and a PGDG install needs `PGRUST_TZDIR=/usr/share/zoneinfo`.
+
 ## Why Nextest is part of the reproduction
 
 A single async benchmark client can hide the effect: it owns one runtime and does little work outside PostgreSQL. A Rust test suite creates short-lived test processes and runtimes while the database is busy. That shared-runner scheduling and connection churn are part of the behavior being measured.

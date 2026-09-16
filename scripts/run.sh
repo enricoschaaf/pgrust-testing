@@ -86,7 +86,7 @@ run_once() {
   echo "engine=$engine run=$run filesystem=$(stat -f -c %T "$data") pool_size=$POOL_SIZE"
   local started finished elapsed
   started=$(date +%s%N)
-  DATABASE_URL="$url" cargo nextest run --release --profile benchmark --no-fail-fast 2>&1 | tee "$test_log"
+  DATABASE_URL="$url" cargo nextest run --release --profile benchmark --no-fail-fast ${NEXTEST_FILTER:+-E "$NEXTEST_FILTER"} 2>&1 | tee "$test_log"
   finished=$(date +%s%N)
   elapsed=$(awk -v start="$started" -v finish="$finished" 'BEGIN { printf "%.6f", (finish-start)/1000000000 }')
   printf '{"engine":"%s","run":%s,"wall_seconds":%s,"pool_size":%s}\n' \
@@ -96,7 +96,7 @@ run_once() {
 
 "$PG_BINDIR/postgres" --version
 "$PGRUST_BIN" --version
-for engine in postgres pgrust; do
+for engine in ${ENGINES:-postgres pgrust}; do
   for run in $(seq 1 "$RUNS"); do
     run_once "$engine" "$run"
   done
