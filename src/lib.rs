@@ -34,7 +34,9 @@ pub fn run_database_test(index: usize) {
     runtime
         .block_on(async move {
             let config = database_config()?;
-            if index.is_multiple_of(12) {
+            if std::env::var_os("PGRUST_EPHEMERAL").is_some() {
+                run_ephemeral_test(&config, index).await
+            } else if index.is_multiple_of(12) {
                 run_isolated_test(&config, index).await
             } else {
                 run_reusable_test(&config, index).await
@@ -82,6 +84,44 @@ pub async fn setup(url: &str, pool_size: usize) -> Result<()> {
     template.batch_execute(&schema_sql()).await?;
     close(template, template_task).await?;
 
+    if std::env::var_os("PGRUST_EPHEMERAL").is_some() {
+        admin
+            .query_one("SELECT pgrust_seal_template($1)", &[&TEMPLATE_DB])
+            .await
+            .context("sealing the template (pgrust test mode)")?;
+        // PGRUST_WARM_POOL=<n>: register the template with one mint, then wait until the
+        // janitor has <n> spares ready so the timed interval starts with a full warm pool.
+        if let Some(target) = std::env::var("PGRUST_WARM_POOL")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+        {
+            let (w, wt) = connect(&config, Some(&format!("tdb_{TEMPLATE_DB}__warmup"))).await?;
+            close(w, wt).await?;
+            let started = std::time::Instant::now();
+            loop {
+                let spares: i64 = admin
+                    .query_one(
+                        "SELECT count(*) FROM pg_database WHERE datname LIKE 'tdb_spare_%'",
+                        &[],
+                    )
+                    .await?
+                    .get(0);
+                if spares >= target {
+                    eprintln!(
+                        "warm pool ready: {spares} spares in {:?}",
+                        started.elapsed()
+                    );
+                    break;
+                }
+                if started.elapsed() > Duration::from_secs(300) {
+                    bail!("warm pool never reached {target} (have {spares})");
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        close(admin, admin_task).await?;
+        return Ok(());
+    }
     for worker in 0..pool_size {
         let database = format!("repro_db_seed_{worker:03}");
         admin
@@ -117,6 +157,15 @@ async fn run_reusable_test(config: &Config, index: usize) -> Result<()> {
     let connections = open_test_connections(config, &lease.database).await?;
     execute_workload(&connections[0].0, index).await?;
     release_database(config, lease, connections).await
+}
+
+async fn run_ephemeral_test(config: &Config, index: usize) -> Result<()> {
+    // pgrust test mode: the template is in the name; the database materializes on
+    // first connection and the janitor drops it once it has been idle for the grace.
+    let database = format!("tdb_{TEMPLATE_DB}__{}_{index}", std::process::id());
+    let connections = open_test_connections(config, &database).await?;
+    execute_workload(&connections[0].0, index).await?;
+    close_all(connections).await
 }
 
 async fn run_isolated_test(config: &Config, index: usize) -> Result<()> {
